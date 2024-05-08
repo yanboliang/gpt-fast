@@ -127,8 +127,12 @@ def _convert_dbrx(
             abstract_key = re.sub(r'.(\d+).', '.{}.', key, count=1)
             layer_num = re.search(r'\d+', key).group(0)
             new_key = weight_map[abstract_key]
+            if layer_num != "0":
+                continue
             if new_key is None:
                 continue
+            print("===>>>>   ", new_key)
+            print(layer_num)
             new_key = new_key.format(layer_num)
         else:
             new_key = weight_map[key]
@@ -143,8 +147,8 @@ def _convert_dbrx(
         elif "gate" in key:
             final_result[key] = final_result[key].contiguous()
 
-    print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
-    torch.save(final_result, checkpoint_dir / "model.pth")
+    print(f"Saving checkpoint to {checkpoint_dir / 'model_small.pth'}")
+    torch.save(final_result, checkpoint_dir / "model_small.pth")
 
 
 if __name__ == '__main__':
@@ -160,7 +164,7 @@ if __name__ == '__main__':
         model_name = checkpoint_dir.name
 
     if "Mixtral-8x7B" in model_name:
-        return _convert_mixtral(checkpoint_dir, model_name)
+        _convert_mixtral(checkpoint_dir, model_name)
     else:
         assert "dbrx" in model_name, f"Unknown model name {model_name}"
-        return _convert_dbrx(checkpoint_dir, model_name)
+        _convert_dbrx(checkpoint_dir=checkpoint_dir, model_name=model_name)

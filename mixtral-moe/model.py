@@ -86,9 +86,9 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim, 100277)
         self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
-        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.norm = nn.LayerNorm(config.dim, eps=config.norm_eps, bias=False)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         self.freqs_cis: Optional[Tensor] = None
@@ -115,8 +115,19 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
+        # print("xxxxxx ", x)
+        # import tp
+        # rank = tp._get_rank()
+        # if rank == 0:
+        #     print("xxxxxx ", x)
+        #     print(mask)
+            # print(freqs_cis)
+
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
+            # if i == 0:
+            #     print("End end end: ")
+            #     print(x)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -139,8 +150,24 @@ class TransformerBlock(nn.Module):
             self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
-        out = h + self.block_sparse_moe(self.ffn_norm(h))
+        import tp
+        rank = tp._get_rank()
+        # print("before norm 1:")
+        # print(x)
+        an = self.attention_norm(x)
+        # print("after norm 1: ")
+        # print(an)
+        att = self.attention(an, freqs_cis, mask, input_pos)
+        # print("after attn")
+        # print(att)
+        h = x + att
+        y = self.ffn_norm(h)
+        # print("y y y : ")
+        # print(y)
+        z = self.block_sparse_moe(y)
+        # print("zzzz ")
+        # print(z)
+        out = h + z
         return out
 
 
@@ -174,6 +201,7 @@ class Attention(nn.Module):
 
         kv_size = self.n_local_heads * self.head_dim
         qkv_states = self.wqkv(x)
+        # breakpoint()
         if self.clip_qkv is not None:
             qkv_states = qkv_states.clamp(min = -self.clip_qkv, max = self.clip_qkv)
         q, k, v = qkv_states.split([self.dim, kv_size, kv_size], dim=-1)
@@ -181,6 +209,11 @@ class Attention(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+
+        # print("QKV: ")
+        # print(q)
+        # print(k)
+        # print(v)
 
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
@@ -192,6 +225,13 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+        # print("QKV: ")
+        # print(q)
+        # print(k)
+        # print(v)
+
+
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
@@ -253,7 +293,7 @@ class RMSNorm(nn.Module):
 def precompute_freqs_cis(
     seq_len: int, n_elem: int, base: int = 10000
 ) -> Tensor:
-    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
+    freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2, dtype=torch.int64)[: (n_elem // 2)].float() / n_elem))
     t = torch.arange(seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
@@ -262,15 +302,45 @@ def precompute_freqs_cis(
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
+    # print("before apply rotary: ")
+    # print(x.transpose(1, 2))
+    # print(freqs_cis)
+    # breakpoint()
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
-    x_out2 = torch.stack(
-        [
-            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
-            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
-        ],
-        -1,
-    )
+    freqs_cis = freqs_cis.clone()
+    # breakpoint()
+    # print("cos")
+    aa = freqs_cis.split([1, 1], dim=-1)
+    a1 = aa[0].squeeze(-1)
+    a2 = aa[1].squeeze(-1)
+    a11 = torch.cat((a1,a1), dim=-1).transpose(1, 2)
+    a22 = torch.cat((a2,a2), dim=-1).transpose(1, 2)
+    x1 = x.transpose(1, 2)
+    y1 = x1[..., : x1.shape[-1] // 2]
+    y2 = x1[..., x1.shape[-1] // 2 :]
+    y12 = torch.cat((-y2, y1), dim=-1)
+    z1 = x1 * a11
+    z2 = y12 * a22
+    z = z1 + z2
+    # breakpoint()
+    # print("RRRRRRR")
+    # print(z)
+    ret = z.transpose(1, 2)
+    return ret
+    # print(freqs_cis[..., 0])
+    # print(freqs_cis[..., 1])
+    # x_out2 = torch.stack(
+    #     [
+    #         xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
+    #         xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
+    #     ],
+    #     -1,
+    # )
 
-    x_out2 = x_out2.flatten(3)
-    return x_out2.type_as(x)
+    # x_out2 = x_out2.flatten(3)
+    # z = x_out2.type_as(x)
+    # breakpoint()
+    # print("zzzz")
+    # print(z.transpose(1, 2))
+    # return z
